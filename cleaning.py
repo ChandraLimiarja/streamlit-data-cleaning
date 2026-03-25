@@ -364,14 +364,19 @@ def export_to_excel(
     df: pd.DataFrame,
     oe_df: pd.DataFrame,
     survey_id: str,
+    config: dict,
     output_dir: str = ".",
 ) -> str:
     """Write three-sheet Excel workbook and return the filepath string.
 
     Sheets:
       A1           – Full dataset sorted by action desc, total_flags desc
-      OE Review    – uuid + OE text columns
+      OE Review    – uuid + OE text columns (keeps original var names)
       Flagged Only – Rows where total_flags > 0
+
+    Flag columns are renamed to human-readable labels derived from
+    *config* before writing.  OE Review is intentionally left untouched
+    so the OE artifact can match columns back correctly.
     """
     today = datetime.now().strftime("%Y-%m-%d")
     filename = f"{survey_id}_data_cleaning_{today}.xlsx"
@@ -389,6 +394,28 @@ def export_to_excel(
     ).copy() if sort_cols else df.copy()
 
     flagged = df_sorted[df_sorted["total_flags"] > 0].copy() if "total_flags" in df_sorted.columns else pd.DataFrame()
+
+    # ── Rename flag columns to human-readable labels ──────────────────
+    rename_map: dict[str, str] = {}
+
+    # Inconsistency checks → use label field (skip manual-check entries)
+    for chk in config.get("inconsistency_checks", []):
+        if not chk.get("manual_check", False) and chk.get("label"):
+            rename_map[f"flag_{chk['id']}"] = chk["label"]
+
+    # Numeric variables → use label field
+    for entry in config.get("numeric_variables", []):
+        if entry.get("label"):
+            rename_map[f"flag_{entry['var']}"] = entry["label"]
+
+    # Straightlining → prefix with "Straightliner – "
+    for grid in config.get("grid_variables", []):
+        if grid.get("label"):
+            rename_map[f"flag_SL_{grid['label']}"] = f"Straightliner – {grid['label']}"
+
+    # Apply rename to the two data sheets (NOT oe_df)
+    df_sorted = df_sorted.rename(columns=rename_map)
+    flagged = flagged.rename(columns=rename_map)
 
     with pd.ExcelWriter(filepath, engine="openpyxl") as writer:
         df_sorted.to_excel(writer, sheet_name="A1", index=False)

@@ -17,7 +17,7 @@ from cleaning import pull_data, apply_standard_flags, build_summary_columns, bui
 # Company-level constants — same across every project
 # ──────────────────────────────────────────────────────────────────────
 CLIENT_ID = "4475"                # Decipher company client ID
-API_KEY   = "st.secrets.get("DECIPHER_API_KEY", os.getenv("DECIPHER_API_KEY", ""))"          # Decipher API key — replace before use
+API_KEY   = "z8ajshbwdkzwb5qms48ty5w85p8h4wvn4e2mytrh258n7hwwe3a6bm5mcxg806nv"          # Decipher API key — replace before use
 
 # ──────────────────────────────────────────────────────────────────────
 # Page config

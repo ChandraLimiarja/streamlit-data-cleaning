@@ -166,7 +166,7 @@ def apply_standard_flags(df: pd.DataFrame, config: dict) -> pd.DataFrame:
             use = vals_numeric if vals_numeric.notna().all() else vals
             if len(use) < mi:
                 return 0.0  # Not enough items to judge
-            return 0.25 if use.nunique() == 1 else 0.0
+            return 0.5 if use.nunique() == 1 else 0.0
 
         df[col_name] = df.apply(_check_sl, axis=1)
 

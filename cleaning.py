@@ -151,7 +151,12 @@ def apply_standard_flags(df: pd.DataFrame, config: dict) -> pd.DataFrame:
     sl_flag_cols: list[str] = []
 
     for grid in grid_cfgs:
-        grid_vars: list[str] = grid["vars"]
+        grid_vars: list[str] = grid.get("vars") or []
+        if not grid_vars:
+            prefix = grid.get("prefix", "")
+            max_idx = grid.get("max_idx")
+            if prefix and max_idx:
+                grid_vars = [f"{prefix}{i}" for i in range(1, max_idx + 1)]
         label: str = grid["label"]
         min_items: int = grid.get("min_straightline_items", 3)
         col_name = f"flag_SL_{label}"

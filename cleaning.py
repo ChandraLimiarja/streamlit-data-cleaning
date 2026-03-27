@@ -13,7 +13,6 @@ import numpy as np
 from datetime import datetime
 from pathlib import Path
 from openpyxl import Workbook
-from openpyxl.utils.dataframe import dataframe_to_rows
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -261,9 +260,10 @@ def apply_standard_flags(df: pd.DataFrame, config: dict) -> pd.DataFrame:
             conditions.append(numeric_vals > rmax)
 
         if conditions:
-            outside = conditions[0]
+            # Use fillna(False) so pd.NA comparisons resolve to False
+            outside = conditions[0].fillna(False)
             for c in conditions[1:]:
-                outside = outside | c
+                outside = outside | c.fillna(False)
             df[col_name] = np.where(numeric_vals.isna(), 0.0,
                                     np.where(outside, 0.5, 0.0))
         else:
@@ -395,6 +395,41 @@ def build_oe_dataframe(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 # Excel export
 # ──────────────────────────────────────────────────────────────────────
 
+def _clean_for_excel(frame: pd.DataFrame) -> pd.DataFrame:
+    """Convert all pandas nullable dtypes (Int64, string, Float64, etc.)
+    to plain Python objects so openpyxl never encounters pd.NA.
+
+    Background: openpyxl handles np.nan and None fine but raises
+    'Cannot convert <NA> to Excel' when it sees pd.NA, which lives
+    inside pandas nullable extension types even after .where() calls.
+    The fix is to cast those columns to object dtype first, then replace.
+    """
+    _nullable_dtypes = (
+        pd.Int8Dtype,   pd.Int16Dtype,  pd.Int32Dtype,  pd.Int64Dtype,
+        pd.UInt8Dtype,  pd.UInt16Dtype, pd.UInt32Dtype, pd.UInt64Dtype,
+        pd.Float32Dtype, pd.Float64Dtype,
+        pd.BooleanDtype, pd.StringDtype,
+    )
+    result = frame.copy()
+    for col in result.columns:
+        if isinstance(result[col].dtype, _nullable_dtypes):
+            result[col] = (
+                result[col]
+                .astype(object)
+                .where(result[col].notna(), other=None)
+            )
+    return result
+
+
+def _write_df_to_sheet(ws, df: pd.DataFrame) -> None:
+    """Write a DataFrame to an openpyxl worksheet using itertuples.
+    Safer than dataframe_to_rows for DataFrames with nullable dtypes.
+    """
+    ws.append(list(df.columns))
+    for row in df.itertuples(index=False):
+        ws.append(list(row))
+
+
 def export_to_excel(
     df: pd.DataFrame,
     oe_df_and_labels,
@@ -415,7 +450,6 @@ def export_to_excel(
     if isinstance(oe_df_and_labels, tuple):
         oe_df, oe_labels = oe_df_and_labels
     else:
-        # Fallback: no labels available
         oe_df     = oe_df_and_labels
         oe_labels = {}
 
@@ -434,19 +468,16 @@ def export_to_excel(
         if "total_flags" in df_sorted.columns
         else pd.DataFrame()
     )
+
     # ── Convert pd.NA → None so openpyxl can write every cell ────────
-    # openpyxl handles np.nan and None but not pandas NA
-    def _clean_for_excel(frame: pd.DataFrame) -> pd.DataFrame:
-        return frame.where(frame.notna(), other=None)
-    
     df_sorted = _clean_for_excel(df_sorted)
     flagged   = _clean_for_excel(flagged)
     oe_df     = _clean_for_excel(oe_df)
 
     # ── Build OE Review two-row header ───────────────────────────────
-    oe_entries      = _safe_list(config.get("oe_variables"))
-    var_name_row    = ["uuid"] + [v["var"]               for v in oe_entries]
-    question_label_row = ["ID"] + [v.get("label", v["var"]) for v in oe_entries]
+    oe_entries         = _safe_list(config.get("oe_variables"))
+    var_name_row       = ["uuid"] + [v["var"]                   for v in oe_entries]
+    question_label_row = ["ID"]   + [v.get("label", v["var"])   for v in oe_entries]
 
     # ── Write workbook with openpyxl directly ────────────────────────
     wb = Workbook()
@@ -454,8 +485,7 @@ def export_to_excel(
     # Sheet 1: A1 — full dataset
     ws_a1       = wb.active
     ws_a1.title = "A1"
-    for r in dataframe_to_rows(df_sorted, index=False, header=True):
-        ws_a1.append(r)
+    _write_df_to_sheet(ws_a1, df_sorted)
 
     # Sheet 2: OE Review — two-row header then data
     ws_oe = wb.create_sheet("OE Review")
@@ -465,9 +495,8 @@ def export_to_excel(
         ws_oe.append(list(row))
 
     # Sheet 3: Flagged Only
-    ws_flag       = wb.create_sheet("Flagged Only")
-    for r in dataframe_to_rows(flagged, index=False, header=True):
-        ws_flag.append(r)
+    ws_flag = wb.create_sheet("Flagged Only")
+    _write_df_to_sheet(ws_flag, flagged)
 
     wb.save(filepath)
     return filepath

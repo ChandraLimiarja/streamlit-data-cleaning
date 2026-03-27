@@ -399,10 +399,9 @@ def _clean_for_excel(frame: pd.DataFrame) -> pd.DataFrame:
     """Convert all pandas nullable dtypes (Int64, string, Float64, etc.)
     to plain Python objects so openpyxl never encounters pd.NA.
 
-    Background: openpyxl handles np.nan and None fine but raises
-    'Cannot convert <NA> to Excel' when it sees pd.NA, which lives
-    inside pandas nullable extension types even after .where() calls.
-    The fix is to cast those columns to object dtype first, then replace.
+    Key detail: iloc assignment preserves the original backing array dtype,
+    so pd.NA sneaks back in. The fix is to rebuild the DataFrame column by
+    column using dict construction, which forces the new object dtype.
     """
     _nullable_dtypes = (
         pd.Int8Dtype,   pd.Int16Dtype,  pd.Int32Dtype,  pd.Int64Dtype,
@@ -410,15 +409,14 @@ def _clean_for_excel(frame: pd.DataFrame) -> pd.DataFrame:
         pd.Float32Dtype, pd.Float64Dtype,
         pd.BooleanDtype, pd.StringDtype,
     )
-    result = frame.copy()
-    for col in result.columns:
-        if isinstance(result[col].dtype, _nullable_dtypes):
-            result[col] = (
-                result[col]
-                .astype(object)
-                .where(result[col].notna(), other=None)
-            )
-    return result
+    cleaned = {}
+    for col in frame.columns:
+        s = frame[col]
+        if isinstance(s.dtype, _nullable_dtypes):
+            cleaned[col] = s.astype(object).where(s.notna(), other=None)
+        else:
+            cleaned[col] = s
+    return pd.DataFrame(cleaned, index=frame.index)
 
 
 def _write_df_to_sheet(ws, df: pd.DataFrame) -> None:
@@ -428,6 +426,81 @@ def _write_df_to_sheet(ws, df: pd.DataFrame) -> None:
     ws.append(list(df.columns))
     for row in df.itertuples(index=False):
         ws.append(list(row))
+
+
+def _build_rename_map(config: dict) -> dict:
+    """Build a rename map from internal flag column names to human-readable
+    labels sourced from the config. Applied to Excel output only — the
+    internal DataFrame keeps the original names throughout processing.
+
+    Mapping rules:
+      flag_incon_XX       → inconsistency_checks[XX]["label"]
+      flag_SL_[label]     → "Straightliner – [label]"
+      flag_[var]          → numeric_variables[var]["label"]
+      flag_speeder        → "Speeder"
+      flag_lagger         → "Lagger"
+      flag_maxdiff_speed  → "MaxDiff Speeder"
+    """
+    rename = {
+        "flag_speeder":       "Speeder",
+        "flag_lagger":        "Lagger",
+        "flag_maxdiff_speed": "MaxDiff Speeder",
+    }
+
+    # Inconsistency checks
+    for chk in _safe_list(config.get("inconsistency_checks")):
+        if chk.get("manual_check", False):
+            continue
+        cid   = chk.get("id", "")
+        label = chk.get("label", "")
+        if cid and label:
+            rename[f"flag_{cid}"] = label
+
+    # Straightlining grids
+    for grid in _safe_list(config.get("grid_variables")):
+        label = grid.get("label", "")
+        if label:
+            rename[f"flag_SL_{label}"] = f"Straightliner – {label}"
+
+    # Numeric variables
+    for entry in _safe_list(config.get("numeric_variables")):
+        var   = entry.get("var", "")
+        label = entry.get("label", "")
+        if var and label:
+            rename[f"flag_{var}"] = label
+
+    return rename
+
+
+def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Reorder DataFrame columns for readability in Excel:
+      1. uuid
+      2. Key identifiers (transid)
+      3. Summary columns (total_flags, SL_Count, reason, action, flag_remove, flag_review)
+      4. Flag columns (flag_* — excluding those already in summary)
+      5. All remaining survey data columns
+    """
+    all_cols = list(df.columns)
+
+    priority    = ["uuid", "transid"]
+    summary     = ["total_flags", "SL_Count", "affected_questions",
+                   "reason", "action", "flag_remove", "flag_review"]
+    summary_set = set(summary)
+    # Exclude flag_remove and flag_review from flag_cols — already in summary
+    flag_cols   = sorted([
+        c for c in all_cols
+        if c.startswith("flag_") and c not in summary_set
+    ])
+    used = set(priority + summary + flag_cols)
+    rest = [c for c in all_cols if c not in used]
+
+    ordered = (
+        [c for c in priority if c in all_cols] +
+        [c for c in summary  if c in all_cols] +
+        flag_cols +
+        rest
+    )
+    return df[ordered]
 
 
 def export_to_excel(
@@ -440,9 +513,10 @@ def export_to_excel(
     """Write three-sheet Excel workbook and return the filepath string.
 
     Sheets:
-      A1           – Full dataset sorted by action desc, total_flags desc
-      OE Review    – Two header rows (var names + question labels) then data
-      Flagged Only – Rows where total_flags > 0
+      A1           – Full dataset: uuid first, summary cols, renamed flags,
+                     then survey data. Sorted by flag_remove desc, total_flags desc.
+      OE Review    – Two header rows (var names + question labels) then data.
+      Flagged Only – Flagged rows only, same column order as A1.
     """
     config = _ensure_dict(config)
 
@@ -458,7 +532,7 @@ def export_to_excel(
     filepath = str(Path(output_dir) / filename)
 
     # ── Sort ──────────────────────────────────────────────────────────
-    sort_cols = [c for c in ["action", "total_flags"] if c in df.columns]
+    sort_cols = [c for c in ["flag_remove", "total_flags"] if c in df.columns]
     df_sorted = (
         df.sort_values(sort_cols, ascending=[False] * len(sort_cols)).copy()
         if sort_cols else df.copy()
@@ -469,6 +543,15 @@ def export_to_excel(
         else pd.DataFrame()
     )
 
+    # ── Reorder columns: uuid → summary → flags → survey data ────────
+    df_sorted = _reorder_columns(df_sorted)
+    flagged   = _reorder_columns(flagged) if not flagged.empty else flagged
+
+    # ── Rename flag columns to human-readable labels ──────────────────
+    rename_map = _build_rename_map(config)
+    df_sorted  = df_sorted.rename(columns=rename_map)
+    flagged    = flagged.rename(columns=rename_map) if not flagged.empty else flagged
+
     # ── Convert pd.NA → None so openpyxl can write every cell ────────
     df_sorted = _clean_for_excel(df_sorted)
     flagged   = _clean_for_excel(flagged)
@@ -476,10 +559,10 @@ def export_to_excel(
 
     # ── Build OE Review two-row header ───────────────────────────────
     oe_entries         = _safe_list(config.get("oe_variables"))
-    var_name_row       = ["uuid"] + [v["var"]                   for v in oe_entries]
-    question_label_row = ["ID"]   + [v.get("label", v["var"])   for v in oe_entries]
+    var_name_row       = ["uuid"] + [v["var"]                 for v in oe_entries]
+    question_label_row = ["ID"]   + [v.get("label", v["var"]) for v in oe_entries]
 
-    # ── Write workbook with openpyxl directly ────────────────────────
+    # ── Write workbook ────────────────────────────────────────────────
     wb = Workbook()
 
     # Sheet 1: A1 — full dataset

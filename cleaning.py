@@ -434,6 +434,14 @@ def export_to_excel(
         if "total_flags" in df_sorted.columns
         else pd.DataFrame()
     )
+    # ── Convert pd.NA → None so openpyxl can write every cell ────────
+    # openpyxl handles np.nan and None but not pandas NA
+    def _clean_for_excel(frame: pd.DataFrame) -> pd.DataFrame:
+        return frame.where(frame.notna(), other=None)
+    
+    df_sorted = _clean_for_excel(df_sorted)
+    flagged   = _clean_for_excel(flagged)
+    oe_df     = _clean_for_excel(oe_df)
 
     # ── Build OE Review two-row header ───────────────────────────────
     oe_entries      = _safe_list(config.get("oe_variables"))

@@ -141,7 +141,7 @@ try:
 
     # Step 7 — Excel export
     status.text("Exporting Excel file...")
-    filepath = export_to_excel(df, oe_df, survey_id, output_dir="/tmp")
+    filepath = export_to_excel(df, oe_df, config, survey_id, output_dir="/tmp")
     progress.progress(100)
     status.text("✅ Pipeline complete!")
 

@@ -287,10 +287,15 @@ def apply_standard_flags(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 # Summary columns
 # ──────────────────────────────────────────────────────────────────────
 
-def build_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
+def build_summary_columns(df: pd.DataFrame, config: dict = None) -> pd.DataFrame:
     """Add total_flags, flag_remove, flag_review, affected_questions,
     reason, and action columns.
+
+    If *config* is supplied, flag labels in the affected_questions column
+    use human-readable names from the config instead of raw column names.
     """
+    config       = _ensure_dict(config) if config else {}
+    label_map    = _build_rename_map(config)   # flag_incon_1 → "label text"
     flag_cols    = [c for c in df.columns if c.startswith("flag_")]
     sl_flag_cols = [c for c in df.columns if c.startswith("flag_SL_")]
 
@@ -316,12 +321,12 @@ def build_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
         detail_parts = []
 
         if row.get("flag_speeder", 0) > 0:
-            parts.append("Speeders")
-            detail_parts.append("Speeders")
+            parts.append("Speeder")
+            detail_parts.append("Speeder")
 
         if row.get("flag_lagger", 0) > 0:
-            parts.append("Laggers")
-            detail_parts.append("Laggers")
+            parts.append("Lagger")
+            detail_parts.append("Lagger")
 
         inc_only = []
         num_only = []
@@ -334,10 +339,12 @@ def build_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
             val = row.get(f, 0)
             if val <= 0:
                 continue
+            # Use the human-readable label if available, else raw name
+            display = label_map.get(f, f)
             if val == 0.5:
-                num_only.append(f)
+                num_only.append(display)
             else:
-                inc_only.append(f)
+                inc_only.append(display)
 
         if inc_only:
             names = ", ".join(inc_only)
@@ -350,7 +357,7 @@ def build_summary_columns(df: pd.DataFrame) -> pd.DataFrame:
             detail_parts.append("Numeric Out-of-Range")
 
         fired_sl = [
-            c.replace("flag_SL_", "")
+            label_map.get(c, c.replace("flag_SL_", ""))
             for c in sl_flag_cols
             if row.get(c, 0) > 0
         ]
@@ -474,7 +481,7 @@ def _build_rename_map(config: dict) -> dict:
 
 def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
     """Reorder DataFrame columns for readability in Excel:
-      1. uuid
+      1. uuid  (guaranteed first — raises if missing)
       2. Key identifiers (transid)
       3. Summary columns (total_flags, SL_Count, reason, action, flag_remove, flag_review)
       4. Flag columns (flag_* — excluding those already in summary)
@@ -482,11 +489,17 @@ def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
     """
     all_cols = list(df.columns)
 
+    # Guarantee uuid is present and first
+    if "uuid" not in all_cols:
+        raise ValueError(
+            "Column 'uuid' not found in the DataFrame. "
+            f"Available columns start with: {all_cols[:10]}"
+        )
+
     priority    = ["uuid", "transid"]
     summary     = ["total_flags", "SL_Count", "affected_questions",
                    "reason", "action", "flag_remove", "flag_review"]
     summary_set = set(summary)
-    # Exclude flag_remove and flag_review from flag_cols — already in summary
     flag_cols   = sorted([
         c for c in all_cols
         if c.startswith("flag_") and c not in summary_set

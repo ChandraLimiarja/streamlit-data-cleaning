@@ -160,7 +160,7 @@ try:
 
     # Step 5 — Build summary columns
     status.text("Building summary columns...")
-    df = build_summary_columns(df)
+    df = build_summary_columns(df, config)
     progress.progress(75)
 
     # Step 6 — Extract OE dataframe for the OE Review sheet

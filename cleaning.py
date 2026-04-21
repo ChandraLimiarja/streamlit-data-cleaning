@@ -432,6 +432,182 @@ def build_oe_dataframe(df: pd.DataFrame, config: dict) -> pd.DataFrame:
 
 
 # ──────────────────────────────────────────────────────────────────────
+# IP risk check (Scamalytics)
+# ──────────────────────────────────────────────────────────────────────
+
+_SCAM_DELAY = (0.6, 1.2)
+_SCAM_RETRIES = 3
+_SCAM_BACKOFF = 2.0
+
+import time
+import random
+
+
+def _scam_fetch(ip: str, username: str, key: str) -> dict:
+    """Call Scamalytics API for a single IP with retry + backoff."""
+    import time, random
+    base_url = f"https://api11.scamalytics.com/v3/{username}/"
+    for attempt in range(_SCAM_RETRIES):
+        try:
+            r = requests.get(
+                base_url, params={"key": key, "ip": ip},
+                headers={"User-Agent": "survey-cleaning/1.0", "Accept": "application/json"},
+                timeout=20,
+            )
+            if r.status_code == 200:
+                try:
+                    return {"ok": True, "json": r.json()}
+                except Exception:
+                    return {"ok": True, "json": {"_raw": r.text}}
+            if r.status_code == 429:
+                time.sleep(_SCAM_BACKOFF ** attempt + random.uniform(0, 1))
+                continue
+            if r.status_code in (401, 403):
+                return {"ok": False, "error": f"Auth error {r.status_code}"}
+            time.sleep(_SCAM_BACKOFF ** attempt + random.uniform(0, 1))
+        except requests.RequestException as e:
+            time.sleep(_SCAM_BACKOFF ** attempt + random.uniform(0, 1))
+    return {"ok": False, "error": "Max retries"}
+
+
+def _nested(d, keys, default=None):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return default
+        cur = cur.get(k, default)
+    return cur
+
+
+def _to_bool(v) -> bool:
+    if v is None or v is False:
+        return False
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, (int, float)):
+        return bool(v)
+    s = str(v).strip().lower()
+    return s in ("1", "true", "t", "yes", "y", "on") or any(
+        k in s for k in ("vpn", "tor", "datacenter", "proxy", "hosting")
+    )
+
+
+def _curate_ip(ip: str, p: dict) -> dict:
+    """Extract curated fields from a Scamalytics API response."""
+    g = lambda *keys: _nested(p, list(keys), "")
+    b = lambda *keys: _to_bool(_nested(p, list(keys)))
+
+    sc = "scamalytics"
+    px = "scamalytics_proxy"
+    ext = "external_datasources"
+
+    score = _nested(p, [sc, "scamalytics_score"])
+    risk = _nested(p, [sc, "scamalytics_risk"], "")
+
+    sc_vpn = b(sc, px, "is_vpn")
+    sc_dc = b(sc, px, "is_datacenter")
+    x4_vpn = b(ext, "x4bnet", "is_vpn")
+    x4_dc = b(ext, "x4bnet", "is_datacenter")
+    x4_tor = b(ext, "x4bnet", "is_tor")
+
+    ip2_type = str(_nested(p, [ext, "ip2proxy_lite", "proxy_type"], "")).lower()
+    ip2_black = b(ext, "ip2proxy_lite", "ip_blacklisted")
+    ipsum_black = b(ext, "ipsum", "ip_blacklisted")
+    spamhaus_black = b(ext, "spamhaus_drop", "ip_blacklisted")
+    firehol_proxy = b(ext, "firehol", "is_proxy")
+    firehol_30 = b(ext, "firehol", "ip_blacklisted_30")
+    firehol_1d = b(ext, "firehol", "ip_blacklisted_1day")
+
+    return {
+        "ip": ip,
+        "risk": risk,
+        "score": score,
+        "isp_risk": _nested(p, [sc, "scamalytics_isp_risk"], ""),
+        "country": g(ext, "dbip", "ip_country_name"),
+        "state": g(ext, "dbip", "ip_state_name"),
+        "city": g(ext, "dbip", "ip_city"),
+        "is_vpn": sc_vpn or x4_vpn or ("vpn" in ip2_type),
+        "is_datacenter": sc_dc or x4_dc or any(k in ip2_type for k in ("datacenter", "hosting")),
+        "is_tor": x4_tor or ("tor" in ip2_type),
+        "is_proxy": any([firehol_proxy, ip2_black, ipsum_black, spamhaus_black, sc_vpn, sc_dc]),
+        "is_blacklisted": any([ip2_black, ipsum_black, spamhaus_black, firehol_1d, firehol_30]),
+        "is_bot": any([
+            _to_bool(_nested(p, [sc, "bot_status"])),
+            b(ext, "x4bnet", "is_bot_operamini"),
+            b(ext, "x4bnet", "is_bot_semrush"),
+            b(ext, "google", "is_googlebot"),
+        ]),
+        "is_icloud_relay": b(sc, px, "is_apple_icloud_private_relay"),
+    }
+
+
+_EMPTY_IP_ROW = {
+    "ip": "", "risk": "", "score": None, "isp_risk": "",
+    "country": "", "state": "", "city": "",
+    "is_vpn": False, "is_datacenter": False, "is_tor": False,
+    "is_proxy": False, "is_blacklisted": False, "is_bot": False,
+    "is_icloud_relay": False, "error": "",
+}
+
+
+def run_ip_check(
+    df: pd.DataFrame,
+    username: str,
+    api_key: str,
+    progress_callback=None,
+) -> pd.DataFrame:
+    """Check unique IPs from the ipAddress column via Scamalytics.
+
+    Returns a DataFrame keyed on ipAddress with risk columns.
+    *progress_callback(fraction)* is called after each IP if provided.
+    """
+    df = ensure_columns(df, ["ipAddress"])
+    unique_ips = df["ipAddress"].dropna().astype(str).unique()
+    unique_ips = [ip for ip in unique_ips if ip and ip != "<NA>"]
+
+    rows = []
+    for i, ip in enumerate(unique_ips):
+        res = _scam_fetch(ip, username, api_key)
+        if res["ok"]:
+            rows.append(_curate_ip(ip, res["json"]))
+        else:
+            row = dict(_EMPTY_IP_ROW)
+            row["ip"] = ip
+            row["error"] = res.get("error", "")
+            rows.append(row)
+        time.sleep(random.uniform(*_SCAM_DELAY))
+        if progress_callback:
+            progress_callback((i + 1) / len(unique_ips))
+
+    ip_df = pd.DataFrame(rows)
+    # Rename "ip" to "ipAddress" for merging
+    ip_df = ip_df.rename(columns={"ip": "ipAddress"})
+    return ip_df
+
+
+def merge_ip_results(df: pd.DataFrame, ip_df: pd.DataFrame) -> pd.DataFrame:
+    """Merge key IP risk columns into the main DataFrame."""
+    merge_cols = ["ipAddress", "risk", "score", "is_vpn", "is_datacenter",
+                  "is_tor", "is_proxy", "is_blacklisted", "is_bot"]
+    merge_cols = [c for c in merge_cols if c in ip_df.columns]
+    merged = df.merge(
+        ip_df[merge_cols],
+        on="ipAddress", how="left", suffixes=("", "_ip"),
+    )
+    # Rename for clarity in output
+    col_renames = {
+        "risk": "ip_risk", "score": "ip_score",
+        "is_vpn": "ip_is_vpn", "is_datacenter": "ip_is_datacenter",
+        "is_tor": "ip_is_tor", "is_proxy": "ip_is_proxy",
+        "is_blacklisted": "ip_is_blacklisted", "is_bot": "ip_is_bot",
+    }
+    for old, new in col_renames.items():
+        if old in merged.columns:
+            merged = merged.rename(columns={old: new})
+    return merged
+
+
+# ──────────────────────────────────────────────────────────────────────
 # Excel export
 # ──────────────────────────────────────────────────────────────────────
 
@@ -565,15 +741,15 @@ def export_to_excel(
     config: dict,
     survey_id: str,
     output_dir: str = ".",
+    ip_df: pd.DataFrame = None,
 ) -> str:
-    """Write three-sheet Excel workbook and return the filepath string.
+    """Write Excel workbook and return the filepath string.
 
     Sheets:
-      A1           – Full dataset: uuid first, summary cols, renamed flags,
-                     then survey data ordered by config's column_order.
-                     Sorted by flag_remove desc, total_flags desc.
+      A1           – Full dataset, sorted by flag_remove desc, total_flags desc.
       OE Review    – Two header rows (var names + question labels) then data.
       Flagged Only – Flagged rows only, same column order as A1.
+      IP Check     – (optional) Deduplicated IP risk results from Scamalytics.
     """
     config = _ensure_dict(config)
 
@@ -647,6 +823,12 @@ def export_to_excel(
     # Sheet 3: Flagged Only
     ws_flag = wb.create_sheet("Flagged Only")
     _write_df_to_sheet(ws_flag, flagged)
+
+    # Sheet 4: IP Check (optional)
+    if ip_df is not None and not ip_df.empty:
+        ip_clean = _clean_for_excel(ip_df)
+        ws_ip = wb.create_sheet("IP Check")
+        _write_df_to_sheet(ws_ip, ip_clean)
 
     wb.save(filepath)
     return filepath

@@ -19,6 +19,7 @@ from cleaning import (
     export_to_excel,
     run_ip_check,
     merge_ip_results,
+    ensure_geoip_db,
 )
 
 # ──────────────────────────────────────────────────────────────────────
@@ -85,6 +86,7 @@ with st.sidebar:
 
     scam_username = ""
     scam_api_key = ""
+    maxmind_key = ""
     if ip_check_enabled:
         scam_username = st.text_input(
             "Scamalytics Username",
@@ -96,6 +98,13 @@ with st.sidebar:
             type="password",
             value=st.secrets.get("SCAM_API_KEY", ""),
             help="Your Scamalytics API key.",
+        )
+        maxmind_key = st.text_input(
+            "MaxMind License Key (optional, for geo)",
+            type="password",
+            value=st.secrets.get("MAXMIND_LICENSE_KEY", ""),
+            help="Free MaxMind license key for IP geolocation. "
+                 "Get one at maxmind.com. Leave blank to skip geo columns.",
         )
 
 # ──────────────────────────────────────────────────────────────────────
@@ -192,10 +201,23 @@ try:
     if ip_check_enabled and scam_username and scam_api_key:
         n_ips = df["ipAddress"].dropna().nunique() if "ipAddress" in df.columns else 0
         status.text(f"Running IP risk check on {n_ips} unique IPs...")
+
+        # Resolve GeoLite2 database (download if needed)
+        geoip_path = ensure_geoip_db(
+            license_key=maxmind_key or None,
+            local_path="GeoLite2-City.mmdb",
+        )
+        if geoip_path:
+            status.text(f"GeoLite2 database ready. Checking {n_ips} IPs...")
+        else:
+            status.text(f"No GeoLite2 database — skipping geo columns. Checking {n_ips} IPs...")
+
         ip_progress = st.progress(0, text="IP check progress")
         def _ip_cb(frac):
             ip_progress.progress(frac, text=f"IP check: {int(frac*100)}%")
-        ip_df = run_ip_check(df, scam_username, scam_api_key, progress_callback=_ip_cb)
+        ip_df = run_ip_check(df, scam_username, scam_api_key,
+                             geoip_db_path=geoip_path or None,
+                             progress_callback=_ip_cb)
         ip_progress.empty()
         df = merge_ip_results(df, ip_df)
         status.text(f"IP check complete — {len(ip_df)} IPs checked.")

@@ -495,7 +495,7 @@ def _build_rename_map(config: dict) -> dict:
         if_var   = chk.get("if_var", "")
         then_var = chk.get("then_var", "")
         if cid and label:
-            prefix = ", ".join(v for v in [if_var, then_var] if v)
+            prefix = ", ".join(dict.fromkeys(v for v in [if_var, then_var] if v))
             rename[f"flag_{cid}"] = f"{prefix}: {label}" if prefix else label
 
     # Straightlining grids → "SL – prefix/label: label"
@@ -512,8 +512,6 @@ def _build_rename_map(config: dict) -> dict:
         label = entry.get("label", "")
         if var and label:
             rename[f"flag_{var}"] = f"{var}: {label}"
-
-    return rename
 
     return rename
 
@@ -593,6 +591,12 @@ def export_to_excel(
     # ── Column order from config (populated by Chat C from Datamap) ───
     column_order = _safe_list(config.get("column_order"))
 
+    # ── Drop Decipher system columns not needed in output ─────────────
+    _drop_prefixes = ("voqtable", "vqtable", "pagetime")
+    drop_cols = [c for c in df.columns if c.startswith(_drop_prefixes)]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+
     # ── Sort ──────────────────────────────────────────────────────────
     sort_cols = [c for c in ["flag_remove", "total_flags"] if c in df.columns]
     df_sorted = (
@@ -606,8 +610,9 @@ def export_to_excel(
     )
 
     # ── Reorder columns: uuid → summary → flags → survey data ────────
-    df_sorted = _reorder_columns(df_sorted, column_order or None)
-    flagged   = _reorder_columns(flagged, column_order or None) if not flagged.empty else flagged
+    dm_order = column_order if column_order else None
+    df_sorted = _reorder_columns(df_sorted, dm_order)
+    flagged   = _reorder_columns(flagged, dm_order) if not flagged.empty else flagged
 
     # ── Rename flag columns to human-readable labels ──────────────────
     rename_map = _build_rename_map(config)

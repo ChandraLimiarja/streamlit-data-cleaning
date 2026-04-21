@@ -17,6 +17,8 @@ from cleaning import (
     build_summary_columns,
     build_oe_dataframe,
     export_to_excel,
+    run_ip_check,
+    merge_ip_results,
 )
 
 # ──────────────────────────────────────────────────────────────────────
@@ -73,6 +75,28 @@ with st.sidebar:
         value=None,
         help="If set, only responses on or after this date are included.",
     )
+
+    st.divider()
+    ip_check_enabled = st.toggle(
+        "Enable IP Risk Check",
+        value=False,
+        help="Run Scamalytics IP check on respondent IPs. Adds an IP Check sheet to the output.",
+    )
+
+    scam_username = ""
+    scam_api_key = ""
+    if ip_check_enabled:
+        scam_username = st.text_input(
+            "Scamalytics Username",
+            value=st.secrets.get("SCAM_USERNAME", ""),
+            help="Your Scamalytics API username.",
+        )
+        scam_api_key = st.text_input(
+            "Scamalytics API Key",
+            type="password",
+            value=st.secrets.get("SCAM_API_KEY", ""),
+            help="Your Scamalytics API key.",
+        )
 
 # ──────────────────────────────────────────────────────────────────────
 # Config parsing and validation
@@ -161,15 +185,29 @@ try:
     # Step 5 — Build summary columns
     status.text("Building summary columns...")
     df = build_summary_columns(df, config)
-    progress.progress(75)
+    progress.progress(70)
 
-    # Step 6 — Extract OE dataframe for the OE Review sheet
-    oe_df = build_oe_dataframe(df, config)
+    # Step 6 — IP risk check (optional)
+    ip_df = None
+    if ip_check_enabled and scam_username and scam_api_key:
+        n_ips = df["ipAddress"].dropna().nunique() if "ipAddress" in df.columns else 0
+        status.text(f"Running IP risk check on {n_ips} unique IPs...")
+        ip_progress = st.progress(0, text="IP check progress")
+        def _ip_cb(frac):
+            ip_progress.progress(frac, text=f"IP check: {int(frac*100)}%")
+        ip_df = run_ip_check(df, scam_username, scam_api_key, progress_callback=_ip_cb)
+        ip_progress.empty()
+        df = merge_ip_results(df, ip_df)
+        status.text(f"IP check complete — {len(ip_df)} IPs checked.")
     progress.progress(80)
 
-    # Step 7 — Export to Excel
+    # Step 7 — Extract OE dataframe for the OE Review sheet
+    oe_df = build_oe_dataframe(df, config)
+    progress.progress(85)
+
+    # Step 8 — Export to Excel
     status.text("Exporting Excel file...")
-    filepath = export_to_excel(df, oe_df, config, survey_id.strip(), output_dir="/tmp")
+    filepath = export_to_excel(df, oe_df, config, survey_id.strip(), output_dir="/tmp", ip_df=ip_df)
     progress.progress(100)
     status.text("✅ Pipeline complete!")
 

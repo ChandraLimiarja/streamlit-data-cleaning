@@ -494,7 +494,6 @@ def _to_bool(v) -> bool:
 
 def _curate_ip(ip: str, p: dict) -> dict:
     """Extract curated fields from a Scamalytics API response."""
-    g = lambda *keys: _nested(p, list(keys), "")
     b = lambda *keys: _to_bool(_nested(p, list(keys)))
 
     sc = "scamalytics"
@@ -523,9 +522,6 @@ def _curate_ip(ip: str, p: dict) -> dict:
         "risk": risk,
         "score": score,
         "isp_risk": _nested(p, [sc, "scamalytics_isp_risk"], ""),
-        "country": g(ext, "dbip", "ip_country_name"),
-        "state": g(ext, "dbip", "ip_state_name"),
-        "city": g(ext, "dbip", "ip_city"),
         "is_vpn": sc_vpn or x4_vpn or ("vpn" in ip2_type),
         "is_datacenter": sc_dc or x4_dc or any(k in ip2_type for k in ("datacenter", "hosting")),
         "is_tor": x4_tor or ("tor" in ip2_type),
@@ -543,23 +539,109 @@ def _curate_ip(ip: str, p: dict) -> dict:
 
 _EMPTY_IP_ROW = {
     "ip": "", "risk": "", "score": None, "isp_risk": "",
-    "country": "", "state": "", "city": "",
     "is_vpn": False, "is_datacenter": False, "is_tor": False,
     "is_proxy": False, "is_blacklisted": False, "is_bot": False,
     "is_icloud_relay": False, "error": "",
 }
 
 
+# ── GeoLite2 geolocation ─────────────────────────────────────────────
+
+_GEOIP_CACHE_PATH = Path("/tmp/GeoLite2-City.mmdb")
+
+
+def ensure_geoip_db(license_key: str = None, local_path: str = None) -> str:
+    """Return a valid path to a GeoLite2-City.mmdb file.
+
+    Resolution order:
+      1. *local_path* if it exists on disk (e.g. committed to repo)
+      2. Cached download at /tmp/GeoLite2-City.mmdb
+      3. Fresh download from MaxMind using *license_key*
+
+    Returns the path string, or "" if no database is available.
+    """
+    # 1. Local file provided and exists
+    if local_path and Path(local_path).is_file():
+        return str(local_path)
+
+    # 2. Already cached from a previous run
+    if _GEOIP_CACHE_PATH.is_file():
+        return str(_GEOIP_CACHE_PATH)
+
+    # 3. Download from MaxMind
+    if not license_key:
+        return ""
+
+    import tarfile
+    import io
+
+    url = (
+        "https://download.maxmind.com/app/geoip_download"
+        f"?edition_id=GeoLite2-City&license_key={license_key}&suffix=tar.gz"
+    )
+    try:
+        r = requests.get(url, timeout=120)
+        r.raise_for_status()
+        with tarfile.open(fileobj=io.BytesIO(r.content), mode="r:gz") as tar:
+            for member in tar.getmembers():
+                if member.name.endswith(".mmdb"):
+                    f = tar.extractfile(member)
+                    if f:
+                        _GEOIP_CACHE_PATH.write_bytes(f.read())
+                        return str(_GEOIP_CACHE_PATH)
+    except Exception:
+        pass
+    return ""
+
+
+def _geoip_enrich(ip_df: pd.DataFrame, db_path: str) -> pd.DataFrame:
+    """Add country, state, city columns to ip_df using a local GeoLite2-City
+    database.  Requires the ``geoip2`` package and a .mmdb file.
+    Falls back gracefully — returns ip_df unchanged if anything is missing.
+    """
+    try:
+        import geoip2.database
+    except ImportError:
+        return ip_df
+
+    if not db_path or not Path(db_path).is_file():
+        return ip_df
+
+    countries, states, cities = [], [], []
+    reader = geoip2.database.Reader(str(db_path))
+    try:
+        for ip in ip_df["ipAddress"]:
+            try:
+                resp = reader.city(ip)
+                countries.append(resp.country.name or "")
+                states.append(resp.subdivisions.most_specific.name if resp.subdivisions else "")
+                cities.append(resp.city.name or "")
+            except Exception:
+                countries.append("")
+                states.append("")
+                cities.append("")
+    finally:
+        reader.close()
+
+    ip_df = ip_df.copy()
+    ip_df.insert(ip_df.columns.get_loc("ipAddress") + 1, "country", countries)
+    ip_df.insert(ip_df.columns.get_loc("country") + 1, "state", states)
+    ip_df.insert(ip_df.columns.get_loc("state") + 1, "city", cities)
+    return ip_df
+
+
+# ── Main IP check entry point ────────────────────────────────────────
+
 def run_ip_check(
     df: pd.DataFrame,
     username: str,
     api_key: str,
+    geoip_db_path: str = None,
     progress_callback=None,
 ) -> pd.DataFrame:
-    """Check unique IPs from the ipAddress column via Scamalytics.
+    """Check unique IPs via Scamalytics and optionally enrich with GeoLite2.
 
-    Returns a DataFrame keyed on ipAddress with risk columns.
-    *progress_callback(fraction)* is called after each IP if provided.
+    Returns a DataFrame keyed on ipAddress with risk + geo columns.
     """
     df = ensure_columns(df, ["ipAddress"])
     unique_ips = df["ipAddress"].dropna().astype(str).unique()
@@ -580,30 +662,48 @@ def run_ip_check(
             progress_callback((i + 1) / len(unique_ips))
 
     ip_df = pd.DataFrame(rows)
-    # Rename "ip" to "ipAddress" for merging
     ip_df = ip_df.rename(columns={"ip": "ipAddress"})
+
+    # Enrich with GeoLite2 geolocation if database is available
+    if geoip_db_path:
+        ip_df = _geoip_enrich(ip_df, geoip_db_path)
+
     return ip_df
 
 
 def merge_ip_results(df: pd.DataFrame, ip_df: pd.DataFrame) -> pd.DataFrame:
-    """Merge key IP risk columns into the main DataFrame."""
-    merge_cols = ["ipAddress", "risk", "score", "is_vpn", "is_datacenter",
-                  "is_tor", "is_proxy", "is_blacklisted", "is_bot"]
+    """Merge selected IP risk columns into the main DataFrame and add
+    duplicate-IP flag and IP total-flags column.
+
+    Columns added to df:
+      ip_risk, ip_is_datacenter, ip_is_blacklisted, ip_is_bot,
+      ip_duplicate, ip_total_flags
+    """
+    # Select only the columns we want in the main data
+    merge_cols = ["ipAddress", "risk", "is_datacenter", "is_blacklisted", "is_bot"]
     merge_cols = [c for c in merge_cols if c in ip_df.columns]
     merged = df.merge(
         ip_df[merge_cols],
         on="ipAddress", how="left", suffixes=("", "_ip"),
     )
-    # Rename for clarity in output
-    col_renames = {
-        "risk": "ip_risk", "score": "ip_score",
-        "is_vpn": "ip_is_vpn", "is_datacenter": "ip_is_datacenter",
-        "is_tor": "ip_is_tor", "is_proxy": "ip_is_proxy",
-        "is_blacklisted": "ip_is_blacklisted", "is_bot": "ip_is_bot",
-    }
-    for old, new in col_renames.items():
+
+    # Rename for clarity
+    for old, new in {"risk": "ip_risk", "is_datacenter": "ip_is_datacenter",
+                     "is_blacklisted": "ip_is_blacklisted", "is_bot": "ip_is_bot"}.items():
         if old in merged.columns:
             merged = merged.rename(columns={old: new})
+
+    # Duplicate IP flag — True if this ipAddress appears for more than one respondent
+    ip_counts = merged["ipAddress"].map(merged["ipAddress"].value_counts())
+    merged["ip_duplicate"] = (ip_counts > 1).fillna(False)
+
+    # IP total flags — count of boolean IP signals that fired
+    ip_flag_cols = ["ip_is_datacenter", "ip_is_blacklisted", "ip_is_bot", "ip_duplicate"]
+    ip_flag_cols = [c for c in ip_flag_cols if c in merged.columns]
+    merged["ip_total_flags"] = merged[ip_flag_cols].apply(
+        lambda row: sum(1 for v in row if v is True or v == 1), axis=1
+    )
+
     return merged
 
 
@@ -694,22 +794,31 @@ def _build_rename_map(config: dict) -> dict:
 
 def _reorder_columns(df: pd.DataFrame, datamap_order: list = None) -> pd.DataFrame:
     """Reorder DataFrame columns for readability in Excel:
-      1. uuid  (guaranteed first — raises if missing)
-      2. Key identifiers (transid)
-      3. Summary columns (total_flags, SL_Count, reason, action, flag_remove, flag_review)
-      4. Flag columns (flag_* — excluding those already in summary)
-      5. All remaining survey data columns — sorted by Datamap order if provided
+      1. uuid
+      2. ipAddress + IP check columns (if present)
+      3. Key identifiers (transid)
+      4. Summary columns (total_flags, SL_Count, reason, action, flag_remove, flag_review)
+      5. Flag columns (flag_* — excluding those already in summary)
+      6. All remaining survey data columns — sorted by Datamap order if provided
     """
     all_cols = list(df.columns)
 
-    # Guarantee uuid is present and first
     if "uuid" not in all_cols:
         raise ValueError(
             "Column 'uuid' not found in the DataFrame. "
             f"Available columns start with: {all_cols[:10]}"
         )
 
-    priority    = ["uuid", "transid"]
+    priority    = ["uuid"]
+
+    # If IP check was run, place ipAddress + IP columns right after uuid
+    ip_cols = ["ipAddress", "ip_risk", "ip_is_datacenter", "ip_is_blacklisted",
+               "ip_is_bot", "ip_duplicate", "ip_total_flags"]
+    ip_cols = [c for c in ip_cols if c in all_cols]
+    priority += ip_cols
+
+    priority += ["transid"]
+
     summary     = ["total_flags", "SL_Count", "affected_questions",
                    "reason", "action", "flag_remove", "flag_review"]
     summary_set = set(summary)
@@ -720,7 +829,6 @@ def _reorder_columns(df: pd.DataFrame, datamap_order: list = None) -> pd.DataFra
     used = set(priority + summary + flag_cols)
     rest = [c for c in all_cols if c not in used]
 
-    # Sort survey data columns by Datamap order if provided
     if datamap_order:
         dm_index = {var: idx for idx, var in enumerate(datamap_order)}
         fallback = len(datamap_order)

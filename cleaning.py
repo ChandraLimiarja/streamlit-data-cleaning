@@ -7,6 +7,7 @@ Dependencies: requests, pandas, numpy, openpyxl
 """
 
 import json
+import re
 import requests
 import pandas as pd
 import numpy as np
@@ -83,6 +84,38 @@ def _resolve_grid_vars(grid: dict) -> list:
     if prefix and max_idx:
         return [f"{prefix}{i}" for i in range(1, int(max_idx) + 1)]
     return []
+
+
+# ──────────────────────────────────────────────────────────────────────
+# Column ordering helpers
+# ──────────────────────────────────────────────────────────────────────
+
+def _datamap_sort_key(col_name: str, dm_index: dict, fallback: int) -> tuple:
+    """Return a sort key (position, suffix) for *col_name* based on the
+    column_order index from the config.
+
+    For exact matches, returns (position, 0).
+    For expanded grid columns (e.g. Parent_2r3c2 → parent Parent_2),
+    finds the longest matching prefix and returns (parent_pos, suffix)
+    so that child columns stay grouped under their parent in order.
+    Unmatched columns sort to *fallback* (end).
+    """
+    if col_name in dm_index:
+        return (dm_index[col_name], 0)
+
+    # Try progressively shorter prefixes to find the parent variable
+    best_pos = fallback
+    best_len = 0
+    for var, pos in dm_index.items():
+        if col_name.startswith(var) and len(var) > best_len:
+            best_pos = pos
+            best_len = len(var)
+
+    # Use the remaining suffix as secondary sort so children stay ordered
+    suffix = col_name[best_len:] if best_len > 0 else col_name
+    nums = re.findall(r"\d+", suffix)
+    suffix_key = tuple(int(n) for n in nums) if nums else (0,)
+    return (best_pos, *suffix_key)
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -440,13 +473,12 @@ def _build_rename_map(config: dict) -> dict:
     labels sourced from the config. Applied to Excel output only — the
     internal DataFrame keeps the original names throughout processing.
 
-    Mapping rules:
-      flag_incon_XX       → inconsistency_checks[XX]["label"]
-      flag_SL_[label]     → "Straightliner – [label]"
-      flag_[var]          → numeric_variables[var]["label"]
-      flag_speeder        → "Speeder"
-      flag_lagger         → "Lagger"
-      flag_maxdiff_speed  → "MaxDiff Speeder"
+    Label format:  "var1, var2: description"
+    Examples:
+      flag_incon_1  → "Current_1, Current_2: Very satisfied but would not recommend"
+      flag_SL_X     → "SL – Parent_4_1: Satisfaction per event-school"
+      flag_S2       → "S2: Age outlier"
+      flag_speeder  → "Speeder"
     """
     rename = {
         "flag_speeder":       "Speeder",
@@ -454,38 +486,45 @@ def _build_rename_map(config: dict) -> dict:
         "flag_maxdiff_speed": "MaxDiff Speeder",
     }
 
-    # Inconsistency checks
+    # Inconsistency checks → "if_var, then_var: label"
     for chk in _safe_list(config.get("inconsistency_checks")):
         if chk.get("manual_check", False):
             continue
-        cid   = chk.get("id", "")
-        label = chk.get("label", "")
+        cid      = chk.get("id", "")
+        label    = chk.get("label", "")
+        if_var   = chk.get("if_var", "")
+        then_var = chk.get("then_var", "")
         if cid and label:
-            rename[f"flag_{cid}"] = label
+            prefix = ", ".join(v for v in [if_var, then_var] if v)
+            rename[f"flag_{cid}"] = f"{prefix}: {label}" if prefix else label
 
-    # Straightlining grids
+    # Straightlining grids → "SL – prefix/label: label"
     for grid in _safe_list(config.get("grid_variables")):
-        label = grid.get("label", "")
+        label  = grid.get("label", "")
+        prefix = grid.get("prefix", "")
         if label:
-            rename[f"flag_SL_{label}"] = f"Straightliner – {label}"
+            var_id = prefix if prefix else label
+            rename[f"flag_SL_{label}"] = f"SL – {var_id}: {label}"
 
-    # Numeric variables
+    # Numeric variables → "var: label"
     for entry in _safe_list(config.get("numeric_variables")):
         var   = entry.get("var", "")
         label = entry.get("label", "")
         if var and label:
-            rename[f"flag_{var}"] = label
+            rename[f"flag_{var}"] = f"{var}: {label}"
+
+    return rename
 
     return rename
 
 
-def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
+def _reorder_columns(df: pd.DataFrame, datamap_order: list = None) -> pd.DataFrame:
     """Reorder DataFrame columns for readability in Excel:
       1. uuid  (guaranteed first — raises if missing)
       2. Key identifiers (transid)
       3. Summary columns (total_flags, SL_Count, reason, action, flag_remove, flag_review)
       4. Flag columns (flag_* — excluding those already in summary)
-      5. All remaining survey data columns
+      5. All remaining survey data columns — sorted by Datamap order if provided
     """
     all_cols = list(df.columns)
 
@@ -507,6 +546,12 @@ def _reorder_columns(df: pd.DataFrame) -> pd.DataFrame:
     used = set(priority + summary + flag_cols)
     rest = [c for c in all_cols if c not in used]
 
+    # Sort survey data columns by Datamap order if provided
+    if datamap_order:
+        dm_index = {var: idx for idx, var in enumerate(datamap_order)}
+        fallback = len(datamap_order)
+        rest.sort(key=lambda c: _datamap_sort_key(c, dm_index, fallback))
+
     ordered = (
         [c for c in priority if c in all_cols] +
         [c for c in summary  if c in all_cols] +
@@ -527,7 +572,8 @@ def export_to_excel(
 
     Sheets:
       A1           – Full dataset: uuid first, summary cols, renamed flags,
-                     then survey data. Sorted by flag_remove desc, total_flags desc.
+                     then survey data ordered by config's column_order.
+                     Sorted by flag_remove desc, total_flags desc.
       OE Review    – Two header rows (var names + question labels) then data.
       Flagged Only – Flagged rows only, same column order as A1.
     """
@@ -544,6 +590,9 @@ def export_to_excel(
     filename = f"{survey_id}_data_cleaning_{today}.xlsx"
     filepath = str(Path(output_dir) / filename)
 
+    # ── Column order from config (populated by Chat C from Datamap) ───
+    column_order = _safe_list(config.get("column_order"))
+
     # ── Sort ──────────────────────────────────────────────────────────
     sort_cols = [c for c in ["flag_remove", "total_flags"] if c in df.columns]
     df_sorted = (
@@ -557,8 +606,8 @@ def export_to_excel(
     )
 
     # ── Reorder columns: uuid → summary → flags → survey data ────────
-    df_sorted = _reorder_columns(df_sorted)
-    flagged   = _reorder_columns(flagged) if not flagged.empty else flagged
+    df_sorted = _reorder_columns(df_sorted, column_order or None)
+    flagged   = _reorder_columns(flagged, column_order or None) if not flagged.empty else flagged
 
     # ── Rename flag columns to human-readable labels ──────────────────
     rename_map = _build_rename_map(config)
